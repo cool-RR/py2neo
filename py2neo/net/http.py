@@ -27,7 +27,7 @@ from py2neo import http_user_agent
 from py2neo.internal.compat import urlsplit
 from py2neo.internal.hydration import JSONHydrator
 from py2neo.net import Connection
-from py2neo.net.api import Result
+from py2neo.net.api import Result, Transaction
 
 
 log = getLogger(__name__)
@@ -49,9 +49,10 @@ class HTTP(Connection):
         super(HTTP, self).__init__(profile, user_agent)
         self.http_pool = None
         self.headers = make_headers(basic_auth=":".join(profile.auth))
-        self.transactions = set()
+        self.transactions = {}
         self.__closed = False
         self._make_pool(profile)
+        self._supports_multi = None
 
     def _make_pool(self, profile):
         self.http_pool = HTTPConnectionPool(
@@ -91,6 +92,7 @@ class HTTP(Connection):
             #   "neo4j_edition" : "community"
             # }
             neo4j_version = metadata["neo4j_version"]
+            self._supports_multi = True
         else:                               # Neo4j 3.x
             # {
             #   "data" : "http://localhost:7474/db/data/",
@@ -118,38 +120,51 @@ class HTTP(Connection):
             #   "neo4j_version" : "3.5.12"
             # }
             neo4j_version = metadata["neo4j_version"]
+            self._supports_multi = False
         self.server_agent = "Neo4j/{}".format(neo4j_version)
+
+    def _transaction_uri(self, db, *segments):
+        if db:
+            if self._supports_multi:
+                return "/".join(("db", db, "tx") + tuple(map(str, segments)))
+            else:
+                # TODO: FeatureError or similar
+                raise RuntimeError("Multiple databases are not supported "
+                                   "with this version of Neo4j")
+        else:
+            return "/".join(("db", "data", "transaction") + tuple(map(str, segments)))
 
     def auto_run(self, cypher, parameters=None,
                  db=None, readonly=False, bookmarks=None, metadata=None, timeout=None):
-        r = self._post("/db/data/transaction/commit", cypher, parameters)
+        r = self._post(self._transaction_uri(db, "commit"), cypher, parameters)
         assert r.status == 200  # TODO: other codes
         data = json_loads(r.data.decode("utf-8"), object_hook=JSONHydrator.json_to_packstream)
         result_data = data["results"][0] if data["results"] else {}
         return HTTPResult(result_data, data["errors"])
 
     def begin(self, db=None, readonly=False, bookmarks=None, metadata=None, timeout=None):
-        r = self._post("/db/data/transaction")
+        r = self._post(self._transaction_uri(db))
         if r.status == 201:
             location_path = urlsplit(r.headers["Location"]).path
             tx = location_path.rpartition("/")[-1]
-            self.transactions.add(tx)
+            self.transactions[tx] = Transaction(db=db)
             return tx
         else:
             raise RuntimeError("Can't begin a new transaction")
 
     def commit(self, tx):
         self._assert_valid_tx(tx)
-        self.transactions.remove(tx)
-        self._post("/db/data/transaction/%s/commit" % tx)
+        transaction = self.transactions.pop(tx)
+        self._post(self._transaction_uri(transaction.db, tx, "commit"))
 
     def rollback(self, tx):
         self._assert_valid_tx(tx)
-        self.transactions.remove(tx)
-        self._delete("/db/data/transaction/%s" % tx)
+        transaction = self.transactions.pop(tx)
+        self._delete(self._transaction_uri(transaction.db, tx))
 
     def run_in_tx(self, tx, cypher, parameters=None):
-        r = self._post("/db/data/transaction/%s" % tx, cypher, parameters)
+        transaction = self.transactions[tx]
+        r = self._post(self._transaction_uri(transaction.db, tx), cypher, parameters)
         assert r.status == 200  # TODO: other codes
         data = json_loads(r.data.decode("utf-8"), object_hook=JSONHydrator.json_to_packstream)
         result_data = data["results"][0] if data["results"] else {}
